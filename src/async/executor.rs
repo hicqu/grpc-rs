@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
+use std::ptr;
 
 use futures::executor::{self, Notify, Spawn};
 use futures::{Async, Future};
@@ -22,6 +23,7 @@ use grpc_sys::{self, GprTimespec, GrpcAlarm};
 
 use cq::CompletionQueue;
 use cq::QueueNotify;
+use error::{Error, Result};
 use super::lock::SpinLock;
 use super::CallTag;
 
@@ -32,13 +34,16 @@ pub struct Alarm {
 }
 
 impl Alarm {
-    pub fn new(cq: &CompletionQueue, tag: Box<CallTag>) -> Alarm {
+    pub fn new(cq: &CompletionQueue, tag: Box<CallTag>) -> Result<Alarm> {
         let alarm = unsafe {
             let ptr = Box::into_raw(tag);
             let timeout = GprTimespec::inf_future();
-            grpc_sys::grpc_alarm_create(cq.as_ptr(), timeout, ptr as _)
+            let cq_ref = cq.borrow()?;
+            let alarm = grpc_sys::grpc_alarm_create(ptr::null_mut());
+            grpc_sys::grpc_alarm_set(alarm, cq_ref.as_ptr(), timeout, ptr as _, ptr::null_mut());
+            alarm
         };
-        Alarm { alarm: alarm }
+        Ok(Alarm { alarm: alarm })
     }
 
     pub fn alarm(&mut self) {
@@ -82,7 +87,15 @@ impl SpawnHandle {
     /// that cq is not run on.
     fn notify(&mut self, tag: Box<CallTag>) {
         self.alarm.take();
-        let mut alarm = Alarm::new(&self.cq, tag);
+        let mut alarm = match Alarm::new(&self.cq, tag) {
+            Ok(a) => a,
+            Err(Error::QueueShutdown) => {
+                // If the queue is shutdown, then the tag will be notified
+                // eventually. So just skip here.
+                return;
+            }
+            Err(e) => panic!("failed to create alarm: {:?}", e),
+        };
         alarm.alarm();
         // We need to keep the alarm until tag is resolved.
         self.alarm = Some(alarm);
@@ -164,6 +177,10 @@ pub struct Executor<'a> {
 impl<'a> Executor<'a> {
     pub fn new(cq: &CompletionQueue) -> Executor {
         Executor { cq: cq }
+    }
+
+    pub(crate) fn cq(&self) -> &CompletionQueue {
+        self.cq
     }
 
     /// Spawn the future into inner poll loop.

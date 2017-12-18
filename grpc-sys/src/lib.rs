@@ -451,10 +451,13 @@ extern "C" {
         tag: *mut c_void,
     ) -> GrpcCallStatus;
 
-    pub fn grpc_alarm_create(
+    pub fn grpc_alarm_create(reserved: *mut c_void) -> *mut GrpcAlarm;
+    pub fn grpc_alarm_set(
+        alarm: *mut GrpcAlarm,
         cq: *mut GrpcCompletionQueue,
         deadline: GprTimespec,
         tag: *mut c_void,
+        reserved: *mut c_void,
     ) -> *mut GrpcAlarm;
     pub fn grpc_alarm_cancel(alarm: *mut GrpcAlarm);
     pub fn grpc_alarm_destroy(alarm: *mut GrpcAlarm);
@@ -488,7 +491,7 @@ mod secure_component {
             addr: *const c_char,
             creds: *mut GrpcServerCredentials,
         ) -> c_int;
-        
+
         pub fn grpcwrap_override_default_ssl_roots(certs: *const c_char);
         pub fn grpc_channel_credentials_release(credentials: *mut GrpcChannelCredentials);
         pub fn grpcwrap_ssl_server_credentials_create(

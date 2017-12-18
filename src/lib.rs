@@ -26,7 +26,6 @@ extern crate libc;
 extern crate log;
 #[cfg(feature = "protobuf-codec")]
 extern crate protobuf;
-extern crate mio;
 
 mod async;
 mod call;

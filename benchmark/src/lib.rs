@@ -25,6 +25,17 @@ extern crate log;
 extern crate rand;
 extern crate tokio_timer;
 
+// Since impl trait is not stable yet, implement this as a function is impossible without box.
+macro_rules! spawn {
+    ($exec:ident, $keep_running:expr, $tag: expr, $f:expr) => {
+        $exec.spawn($f.map(|_| ()).map_err(move |e| {
+            if $keep_running.load(Ordering::SeqCst) {
+                error!("failed to execute {}: {:?}", $tag, e);
+            }
+        }))
+    };
+}
+
 mod bench;
 mod client;
 mod error;
@@ -33,3 +44,4 @@ mod worker;
 mod util;
 
 pub use worker::Worker;
+pub use util::log_util::init_log;
