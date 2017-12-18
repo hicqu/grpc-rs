@@ -74,7 +74,7 @@ fn build_grpc(cc: &mut Build, library: &str) {
 
     let mut zlib = "z";
     let build_dir = format!("{}/build", dst.display());
-    let third_party = vec!["cares/cares/lib", "zlib", "boringssl/ssl", "boringssl/crypto"];
+    let third_party = vec!["cares", "zlib", "boringssl/ssl", "boringssl/crypto"];
     if cfg!(target_os = "windows") {
         let profile = match &*env::var("PROFILE").unwrap_or("debug".to_owned()) {
             "bench" | "release" => {
