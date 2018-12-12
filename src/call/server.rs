@@ -20,7 +20,10 @@ use grpc_sys::{self, GprClockType, GprTimespec, GrpcCallStatus, GrpcRequestCallC
 
 use super::{RpcStatus, ShareCall, ShareCallHolder, WriteFlags};
 use async::{BatchFuture, CallTag, Executor, Kicker, SpinLock};
-use call::{BatchContext, Call, MethodType, RpcStatusCode, SinkBase, StreamingBase};
+use call::{
+    BatchContext, Call, MessageReader, MessageWriter, MethodType, RpcStatusCode, SinkBase,
+    StreamingBase,
+};
 use codec::{DeserializeFn, SerializeFn};
 use cq::CompletionQueue;
 use error::Error;
@@ -78,7 +81,7 @@ impl RequestContext {
             Some(handler) => match handler.method_type() {
                 MethodType::Unary | MethodType::ServerStreaming => Err(self),
                 _ => {
-                    execute(self, cq, &[], handler);
+                    execute(self, cq, None, handler);
                     Ok(())
                 }
             },
@@ -198,6 +201,10 @@ impl UnaryRequestContext {
         &self.batch
     }
 
+    pub fn batch_ctx_mut(&mut self) -> &mut BatchContext {
+        &mut self.batch
+    }
+
     pub fn request_ctx(&self) -> &RequestContext {
         &self.request
     }
@@ -206,10 +213,15 @@ impl UnaryRequestContext {
         self.request_call.take()
     }
 
-    pub fn handle(self, rc: &mut RequestCallContext, cq: &CompletionQueue, data: Option<&[u8]>) {
+    pub fn handle(
+        self,
+        rc: &mut RequestCallContext,
+        cq: &CompletionQueue,
+        reader: Option<MessageReader>,
+    ) {
         let handler = unsafe { rc.get_handler(self.request.method()).unwrap() };
-        if let Some(data) = data {
-            return execute(self.request, cq, data, handler);
+        if reader.is_some() {
+            return execute(self.request, cq, reader, handler);
         }
 
         let status = RpcStatus::new(RpcStatusCode::Internal, Some("No payload".to_owned()));
@@ -247,14 +259,11 @@ impl<T> Stream for RequestStream<T> {
             let mut call = self.call.lock();
             call.check_alive()?;
         }
-        let data = try_ready!(self.base.poll(&mut self.call, false));
 
-        match data {
+        match try_ready!(self.base.poll(&mut self.call, false)).map(self.de) {
             None => Ok(Async::Ready(None)),
-            Some(data) => {
-                let msg = (self.de)(&data)?;
-                Ok(Async::Ready(Some(msg)))
-            }
+            Some(Ok(data)) => Ok(Async::Ready(Some(data))),
+            Some(Err(err)) => Err(err),
         }
     }
 }
@@ -321,9 +330,9 @@ macro_rules! impl_unary_sink {
                 self.complete(status, None)
             }
 
-            fn complete(mut self, status: RpcStatus, t: Option<T>) -> $rt {
-                let data = t.as_ref().map(|t| {
-                    let mut buf = vec![];
+            fn complete(mut self, status: RpcStatus, mut t: Option<T>) -> $rt {
+                let mut data = t.as_mut().as_ref().map(|t| {
+                    let mut buf = MessageWriter::new();
                     (self.ser)(t, &mut buf);
                     buf
                 });
@@ -331,7 +340,7 @@ macro_rules! impl_unary_sink {
                 let write_flags = self.write_flags;
                 let res = self.call.as_mut().unwrap().call(|c| {
                     c.call
-                        .start_send_status_from_server(&status, true, &data, write_flags)
+                        .start_send_status_from_server(&status, true, &mut data, write_flags)
                 });
 
                 let (cq_f, err) = match res {
@@ -421,7 +430,7 @@ macro_rules! impl_stream_sink {
                 let send_metadata = self.base.send_metadata;
                 let res = self.call.as_mut().unwrap().call(|c| {
                     c.call
-                        .start_send_status_from_server(&status, send_metadata, &None, 0)
+                        .start_send_status_from_server(&status, send_metadata, &mut None, 0)
                 });
 
                 let (fail_f, err) = match res {
@@ -472,6 +481,9 @@ macro_rules! impl_stream_sink {
             }
 
             fn poll_complete(&mut self) -> Poll<(), Error> {
+                if let Async::Ready(_) = self.call.as_mut().unwrap().call(|c| c.poll_finish())? {
+                    return Err(Error::RemoteStopped);
+                }
                 self.base.poll_complete()
             }
 
@@ -483,7 +495,7 @@ macro_rules! impl_stream_sink {
                     let status = &self.status;
                     let flush_f = self.call.as_mut().unwrap().call(|c| {
                         c.call
-                            .start_send_status_from_server(status, send_metadata, &None, 0)
+                            .start_send_status_from_server(status, send_metadata, &mut None, 0)
                     })?;
                     self.flush_f = Some(flush_f);
                 }
@@ -634,7 +646,7 @@ pub fn execute_unary<P, Q, F>(
     ctx: RpcContext,
     ser: SerializeFn<Q>,
     de: DeserializeFn<P>,
-    payload: &[u8],
+    payload: MessageReader,
     f: &mut F,
 ) where
     F: FnMut(RpcContext, P, UnarySink<Q>),
@@ -679,7 +691,7 @@ pub fn execute_server_streaming<P, Q, F>(
     ctx: RpcContext,
     ser: SerializeFn<Q>,
     de: DeserializeFn<P>,
-    payload: &[u8],
+    payload: MessageReader,
     f: &mut F,
 ) where
     F: FnMut(RpcContext, P, ServerStreamingSink<Q>),
@@ -733,7 +745,12 @@ pub fn execute_unimplemented(ctx: RequestContext, cq: CompletionQueue) {
 // Helper function to call handler.
 //
 // Invoked after a request is ready to be handled.
-fn execute(ctx: RequestContext, cq: &CompletionQueue, payload: &[u8], f: &mut BoxHandler) {
+fn execute(
+    ctx: RequestContext,
+    cq: &CompletionQueue,
+    payload: Option<MessageReader>,
+    f: &mut BoxHandler,
+) {
     let rpc_ctx = RpcContext::new(ctx, cq);
     f.handle(rpc_ctx, payload)
 }
