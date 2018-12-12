@@ -785,6 +785,8 @@ struct SinkBase {
     send_metadata: bool,
 }
 
+unsafe impl Sync for SinkBase {}
+
 impl SinkBase {
     fn new(send_metadata: bool) -> SinkBase {
         SinkBase {
