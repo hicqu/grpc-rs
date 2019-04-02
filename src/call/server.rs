@@ -19,7 +19,7 @@ use futures::{Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
 use grpc_sys::{self, GprClockType, GprTimespec, GrpcCallStatus, GrpcRequestCallContext};
 
 use super::{RpcStatus, ShareCall, ShareCallHolder, WriteFlags};
-use async::{BatchFuture, CallTag, Executor, Kicker, SpinLock};
+use async::{BatchFuture, CallTag, Executor, SpinLock};
 use call::{BatchContext, Call, MethodType, RpcStatusCode, SinkBase, StreamingBase};
 use codec::{DeserializeFn, SerializeFn};
 use cq::CompletionQueue;
@@ -578,11 +578,6 @@ impl<'a> RpcContext<'a> {
         }
     }
 
-    fn kicker(&self) -> Kicker {
-        let call = self.call();
-        Kicker::from_call(call)
-    }
-
     pub(crate) fn call(&self) -> Call {
         self.ctx.call(self.executor.cq().clone())
     }
@@ -616,7 +611,7 @@ impl<'a> RpcContext<'a> {
     where
         F: Future<Item = (), Error = ()> + Send + 'static,
     {
-        self.executor.spawn(f, self.kicker())
+        self.executor.spawn(f)
     }
 }
 

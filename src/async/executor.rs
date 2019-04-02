@@ -12,17 +12,12 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use std::thread::{self, ThreadId};
 
 use futures::executor::{self, Notify, Spawn};
 use futures::{Async, Future};
 
 use super::lock::SpinLock;
-use super::CallTag;
-use call::Call;
 use cq::CompletionQueue;
-use error::{Error, Result};
-use grpc_sys::{self, GrpcCallStatus};
 
 type BoxFuture<T, E> = Box<Future<Item = T, Error = E> + Send>;
 
@@ -30,65 +25,8 @@ type BoxFuture<T, E> = Box<Future<Item = T, Error = E> + Send>;
 /// Inner future is expected to be polled in the same thread as cq.
 type SpawnHandle = Option<Spawn<BoxFuture<(), ()>>>;
 
-pub(crate) struct Kicker {
-    call: Call,
-}
-
-impl Kicker {
-    pub fn from_call(call: Call) -> Kicker {
-        Kicker { call }
-    }
-
-    /// Kick its completion queue.
-    pub fn kick(&self, tag: Box<CallTag>) -> Result<()> {
-        let _ref = self.call.cq.borrow()?;
-        unsafe {
-            let ptr = Box::into_raw(tag);
-            let status = grpc_sys::grpcwrap_call_kick_completion_queue(self.call.call, ptr as _);
-            if status == GrpcCallStatus::Ok {
-                Ok(())
-            } else {
-                Err(Error::CallFailure(status))
-            }
-        }
-    }
-}
-
-unsafe impl Sync for Kicker {}
-
-impl Clone for Kicker {
-    fn clone(&self) -> Kicker {
-        // Bump call's reference count.
-        let call = unsafe {
-            grpc_sys::grpc_call_ref(self.call.call);
-            self.call.call
-        };
-        let cq = self.call.cq.clone();
-        Kicker {
-            call: Call { call, cq },
-        }
-    }
-}
-
 struct NotifyContext {
     kicked: bool,
-    kicker: Kicker,
-}
-
-impl NotifyContext {
-    /// Notify the completion queue.
-    ///
-    /// It only makes sence to call this function from the thread
-    /// that cq is not run on.
-    fn notify(&mut self, tag: Box<CallTag>) {
-        match self.kicker.kick(tag) {
-            // If the queue is shutdown, then the tag will be notified
-            // eventually. So just skip here.
-            Err(Error::QueueShutdown) => return,
-            Err(e) => panic!("unexpected error when canceling call: {:?}", e),
-            _ => (),
-        }
-    }
 }
 
 /// A custom notify.
@@ -99,40 +37,22 @@ impl NotifyContext {
 pub struct SpawnNotify {
     ctx: Arc<SpinLock<NotifyContext>>,
     handle: Arc<SpinLock<SpawnHandle>>,
-    worker_id: ThreadId,
 }
 
 impl SpawnNotify {
-    fn new(s: Spawn<BoxFuture<(), ()>>, kicker: Kicker, worker_id: ThreadId) -> SpawnNotify {
+    fn new(s: Spawn<BoxFuture<(), ()>>) -> SpawnNotify {
         SpawnNotify {
-            worker_id,
             handle: Arc::new(SpinLock::new(Some(s))),
             ctx: Arc::new(SpinLock::new(NotifyContext {
                 kicked: false,
-                kicker,
             })),
         }
-    }
-
-    pub fn resolve(self, success: bool) {
-        // it should always be canceled for now.
-        assert!(success);
-        poll(&Arc::new(self.clone()), true);
     }
 }
 
 impl Notify for SpawnNotify {
     fn notify(&self, _: usize) {
-        if thread::current().id() == self.worker_id {
-            poll(&Arc::new(self.clone()), false)
-        } else {
-            let mut ctx = self.ctx.lock();
-            if ctx.kicked {
-                return;
-            }
-            ctx.notify(Box::new(CallTag::Spawn(self.clone())));
-            ctx.kicked = true;
-        }
+        poll(&Arc::new(self.clone()), false)
     }
 }
 
@@ -178,12 +98,12 @@ impl<'a> Executor<'a> {
     ///
     /// If you want to trace the future, you may need to create a sender/receiver
     /// pair by yourself.
-    pub fn spawn<F>(&self, f: F, kicker: Kicker)
+    pub fn spawn<F>(&self, f: F)
     where
         F: Future<Item = (), Error = ()> + Send + 'static,
     {
         let s = executor::spawn(Box::new(f) as BoxFuture<_, _>);
-        let notify = Arc::new(SpawnNotify::new(s, kicker, self.cq.worker_id()));
+        let notify = Arc::new(SpawnNotify::new(s));
         poll(&notify, false)
     }
 }
