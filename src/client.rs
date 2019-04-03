@@ -20,7 +20,6 @@ use crate::call::client::{
 use crate::call::{Call, Method};
 use crate::channel::Channel;
 use crate::task::Executor;
-use crate::task::Kicker;
 
 use crate::error::Result;
 
@@ -28,15 +27,12 @@ use crate::error::Result;
 #[derive(Clone)]
 pub struct Client {
     channel: Channel,
-    // Used to kick its completion queue.
-    kicker: Kicker,
 }
 
 impl Client {
     /// Initialize a new [`Client`].
     pub fn new(channel: Channel) -> Client {
-        let kicker = channel.create_kicker().unwrap();
-        Client { channel, kicker }
+        Client { channel }
     }
 
     /// Create a synchronized unary RPC call.
@@ -104,7 +100,6 @@ impl Client {
     where
         F: Future<Item = (), Error = ()> + Send + 'static,
     {
-        let kicker = self.kicker.clone();
-        Executor::new(self.channel.cq()).spawn(f, kicker)
+        Executor::new(self.channel.cq()).spawn(f)
     }
 }

@@ -23,7 +23,6 @@ use futures::task::{self, Task};
 use futures::{Async, Future, Poll};
 
 use self::callback::{Abort, Request as RequestCallback, UnaryRequest as UnaryRequestCallback};
-use self::executor::SpawnNotify;
 use self::promise::{Batch as BatchPromise, Shutdown as ShutdownPromise};
 use crate::call::server::RequestContext;
 use crate::call::{BatchContext, Call, MessageReader};
@@ -31,7 +30,7 @@ use crate::cq::CompletionQueue;
 use crate::error::{Error, Result};
 use crate::server::RequestCallContext;
 
-pub(crate) use self::executor::{Executor, Kicker};
+pub(crate) use self::executor::Executor;
 pub use self::lock::SpinLock;
 pub use self::promise::BatchType;
 
@@ -126,7 +125,6 @@ pub enum CallTag {
     UnaryRequest(UnaryRequestCallback),
     Abort(Abort),
     Shutdown(ShutdownPromise),
-    Spawn(SpawnNotify),
 }
 
 impl CallTag {
@@ -188,7 +186,6 @@ impl CallTag {
             CallTag::UnaryRequest(cb) => cb.resolve(cq, success),
             CallTag::Abort(_) => {}
             CallTag::Shutdown(prom) => prom.resolve(success),
-            CallTag::Spawn(notify) => notify.resolve(success),
         }
     }
 }
@@ -201,7 +198,6 @@ impl Debug for CallTag {
             CallTag::UnaryRequest(_) => write!(f, "CallTag::UnaryRequest(..)"),
             CallTag::Abort(_) => write!(f, "CallTag::Abort(..)"),
             CallTag::Shutdown(_) => write!(f, "CallTag::Shutdown"),
-            CallTag::Spawn(_) => write!(f, "CallTag::Spawn"),
         }
     }
 }

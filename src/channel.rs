@@ -26,7 +26,6 @@ use crate::call::{Call, Method};
 use crate::cq::CompletionQueue;
 use crate::env::Environment;
 use crate::error::Result;
-use crate::task::Kicker;
 use crate::CallOption;
 
 pub use crate::grpc_sys::{
@@ -576,31 +575,6 @@ impl Channel {
     // changing the state.
     pub fn check_connectivity_state(&self, try_to_connect: bool) -> ConnectivityState {
         self.inner.check_connectivity_state(try_to_connect)
-    }
-
-    /// Create a Kicker.
-    pub(crate) fn create_kicker(&self) -> Result<Kicker> {
-        let cq_ref = self.cq.borrow()?;
-        let raw_call = unsafe {
-            let ch = self.inner.channel;
-            let cq = cq_ref.as_ptr();
-            // Do not timeout.
-            let timeout = GprTimespec::inf_future();
-            grpc_sys::grpcwrap_channel_create_call(
-                ch,
-                ptr::null_mut(),
-                0,
-                cq,
-                ptr::null(),
-                0,
-                ptr::null(),
-                0,
-                timeout,
-                ptr::null_mut(),
-            )
-        };
-        let call = unsafe { Call::from_raw(raw_call, self.cq.clone()) };
-        Ok(Kicker::from_call(call))
     }
 
     /// Create a call using the method and option.

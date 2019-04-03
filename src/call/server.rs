@@ -27,7 +27,7 @@ use crate::cq::CompletionQueue;
 use crate::error::Error;
 use crate::metadata::Metadata;
 use crate::server::{BoxHandler, RequestCallContext};
-use crate::task::{BatchFuture, CallTag, Executor, Kicker, SpinLock};
+use crate::task::{BatchFuture, CallTag, Executor, SpinLock};
 
 pub struct Deadline {
     spec: GprTimespec,
@@ -586,11 +586,6 @@ impl<'a> RpcContext<'a> {
         }
     }
 
-    fn kicker(&self) -> Kicker {
-        let call = self.call();
-        Kicker::from_call(call)
-    }
-
     pub(crate) fn call(&self) -> Call {
         self.ctx.call(self.executor.cq().clone())
     }
@@ -624,7 +619,7 @@ impl<'a> RpcContext<'a> {
     where
         F: Future<Item = (), Error = ()> + Send + 'static,
     {
-        self.executor.spawn(f, self.kicker())
+        self.executor.spawn(f)
     }
 }
 
