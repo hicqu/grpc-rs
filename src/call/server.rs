@@ -12,7 +12,6 @@
 // limitations under the License.
 
 use std::ffi::CStr;
-use std::sync::Arc;
 use std::{result, slice};
 
 use crate::grpc_sys::{self, GprClockType, GprTimespec, GrpcCallStatus, GrpcRequestCallContext};
@@ -27,7 +26,7 @@ use crate::cq::CompletionQueue;
 use crate::error::Error;
 use crate::metadata::Metadata;
 use crate::server::{BoxHandler, RequestCallContext};
-use crate::task::{BatchFuture, CallTag, Executor, SpinLock};
+use crate::task::{BatchFuture, CallTag, Executor};
 
 pub struct Deadline {
     spec: GprTimespec,
@@ -234,13 +233,13 @@ impl UnaryRequestContext {
 /// finish before dropping.
 #[must_use = "if unused the RequestStream may immediately cancel the RPC"]
 pub struct RequestStream<T> {
-    call: Arc<SpinLock<ShareCall>>,
+    call: ShareCall,
     base: StreamingBase,
     de: DeserializeFn<T>,
 }
 
 impl<T> RequestStream<T> {
-    fn new(call: Arc<SpinLock<ShareCall>>, de: DeserializeFn<T>) -> RequestStream<T> {
+    fn new(call: ShareCall, de: DeserializeFn<T>) -> RequestStream<T> {
         RequestStream {
             call,
             base: StreamingBase::new(None),
@@ -254,11 +253,7 @@ impl<T> Stream for RequestStream<T> {
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Option<T>, Error> {
-        {
-            let mut call = self.call.lock();
-            call.check_alive()?;
-        }
-
+        self.call.check_alive()?;
         match try_ready!(self.base.poll(&mut self.call, false)).map(self.de) {
             None => Ok(Async::Ready(None)),
             Some(Ok(data)) => Ok(Async::Ready(Some(data))),
@@ -389,7 +384,7 @@ impl_unary_sink!(
     #[must_use = "if unused the sink may immediately cancel the RPC"]
     ClientStreamingSink,
     ClientStreamingSinkResult,
-    Arc<SpinLock<ShareCall>>
+    ShareCall
 );
 
 // A macro helper to implement server side streaming sink.
@@ -567,7 +562,7 @@ impl_stream_sink!(
     #[must_use = "if unused the sink may immediately cancel the RPC"]
     DuplexSink,
     DuplexSinkFailure,
-    Arc<SpinLock<ShareCall>>
+    ShareCall
 );
 
 /// A context for rpc handling.
@@ -673,9 +668,9 @@ pub fn execute_client_streaming<P, Q, F>(
 {
     let mut call = ctx.call();
     let close_f = accept_call!(call);
-    let call = Arc::new(SpinLock::new(ShareCall::new(call, close_f)));
+    let call = ShareCall::new(call, close_f);
 
-    let req_s = RequestStream::new(call.clone(), de);
+    let req_s = RequestStream::new(call.dup(), de);
     let sink = ClientStreamingSink::new(call, ser);
     f(ctx, req_s, sink)
 }
@@ -720,9 +715,9 @@ pub fn execute_duplex_streaming<P, Q, F>(
 {
     let mut call = ctx.call();
     let close_f = accept_call!(call);
-    let call = Arc::new(SpinLock::new(ShareCall::new(call, close_f)));
+    let call = ShareCall::new(call, close_f);
 
-    let req_s = RequestStream::new(call.clone(), de);
+    let req_s = RequestStream::new(call.dup(), de);
     let sink = DuplexSink::new(call, ser);
     f(ctx, req_s, sink)
 }

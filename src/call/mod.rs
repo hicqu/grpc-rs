@@ -15,6 +15,7 @@ pub mod client;
 pub mod server;
 
 use std::io::{self, BufRead, ErrorKind, Read};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{cmp, mem, ptr, slice, usize};
 
@@ -29,7 +30,7 @@ use libc::c_void;
 
 use crate::codec::{DeserializeFn, Marshaller, SerializeFn};
 use crate::error::{Error, Result};
-use crate::task::{self, BatchFuture, BatchType, CallTag, SpinLock};
+use crate::task::{self, BatchFuture, BatchType, CallTag};
 
 pub use crate::grpc_sys::GrpcStatusCode as RpcStatusCode;
 
@@ -404,6 +405,7 @@ where
 pub struct Call {
     pub call: *mut GrpcCall,
     pub cq: CompletionQueue,
+    ref_count: Arc<AtomicUsize>,
 }
 
 unsafe impl Send for Call {}
@@ -411,7 +413,12 @@ unsafe impl Send for Call {}
 impl Call {
     pub unsafe fn from_raw(call: *mut grpc_sys::GrpcCall, cq: CompletionQueue) -> Call {
         assert!(!call.is_null());
-        Call { call, cq }
+        let ref_count = Arc::new(AtomicUsize::new(1));
+        Call {
+            call,
+            cq,
+            ref_count,
+        }
     }
 
     /// Send a message asynchronously.
@@ -558,7 +565,9 @@ impl Call {
 
 impl Drop for Call {
     fn drop(&mut self) {
-        unsafe { grpc_sys::grpc_call_unref(self.call) }
+        if self.ref_count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            unsafe { grpc_sys::grpc_call_unref(self.call) }
+        }
     }
 }
 
@@ -574,7 +583,25 @@ struct ShareCall {
     status: Option<RpcStatus>,
 }
 
+unsafe impl Sync for ShareCall {}
+
 impl ShareCall {
+    fn dup(&self) -> ShareCall {
+        let call = Call {
+            call: self.call.call,
+            cq: self.call.cq.clone(),
+            ref_count: Arc::clone(&self.call.ref_count),
+        };
+        call.ref_count.fetch_add(1, Ordering::SeqCst);
+        let close_f = BatchFuture::new(Arc::clone(&self.close_f.inner));
+        ShareCall {
+            call,
+            close_f,
+            finished: false,
+            status: None,
+        }
+    }
+
     fn new(call: Call, close_f: BatchFuture) -> ShareCall {
         ShareCall {
             call,
@@ -624,13 +651,6 @@ trait ShareCallHolder {
 impl ShareCallHolder for ShareCall {
     fn call<R, F: FnOnce(&mut ShareCall) -> R>(&mut self, f: F) -> R {
         f(self)
-    }
-}
-
-impl ShareCallHolder for Arc<SpinLock<ShareCall>> {
-    fn call<R, F: FnOnce(&mut ShareCall) -> R>(&mut self, f: F) -> R {
-        let mut call = self.lock();
-        f(&mut call)
     }
 }
 

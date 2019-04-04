@@ -81,11 +81,11 @@ pub fn check_alive<T>(f: &CqFuture<T>) -> Result<()> {
 
 /// A future object for task that is scheduled to `CompletionQueue`.
 pub struct CqFuture<T> {
-    inner: Arc<Inner<T>>,
+    pub inner: Arc<Inner<T>>,
 }
 
 impl<T> CqFuture<T> {
-    fn new(inner: Arc<Inner<T>>) -> CqFuture<T> {
+    pub fn new(inner: Arc<Inner<T>>) -> CqFuture<T> {
         CqFuture { inner }
     }
 }

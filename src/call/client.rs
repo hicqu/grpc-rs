@@ -12,7 +12,6 @@
 // limitations under the License.
 
 use std::ptr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::grpc_sys;
@@ -24,7 +23,7 @@ use crate::channel::Channel;
 use crate::codec::{DeserializeFn, SerializeFn};
 use crate::error::{Error, Result};
 use crate::metadata::Metadata;
-use crate::task::{BatchFuture, BatchType, SpinLock};
+use crate::task::{BatchFuture, BatchType};
 
 /// Update the flag bit in res.
 #[inline]
@@ -150,8 +149,8 @@ impl Call {
             )
         });
 
-        let share_call = Arc::new(SpinLock::new(ShareCall::new(call, cq_f)));
-        let sink = ClientCStreamSender::new(share_call.clone(), method.req_ser());
+        let share_call = ShareCall::new(call, cq_f);
+        let sink = ClientCStreamSender::new(share_call.dup(), method.req_ser());
         let recv = ClientCStreamReceiver {
             call: share_call,
             resp_de: method.resp_de(),
@@ -215,8 +214,8 @@ impl Call {
             grpc_sys::grpcwrap_call_recv_initial_metadata(call.call, ctx, tag)
         });
 
-        let share_call = Arc::new(SpinLock::new(ShareCall::new(call, cq_f)));
-        let sink = ClientDuplexSender::new(share_call.clone(), method.req_ser());
+        let share_call = ShareCall::new(call, cq_f);
+        let sink = ClientDuplexSender::new(share_call.dup(), method.req_ser());
         let recv = ClientDuplexReceiver::new(share_call, method.resp_de());
         Ok((sink, recv))
     }
@@ -273,7 +272,7 @@ impl<T> Future for ClientUnaryReceiver<T> {
 /// [`Cancelled`]: ./enum.RpcStatusCode.html#variant.Cancelled
 #[must_use = "if unused the ClientCStreamReceiver may immediately cancel the RPC"]
 pub struct ClientCStreamReceiver<T> {
-    call: Arc<SpinLock<ShareCall>>,
+    call: ShareCall,
     resp_de: DeserializeFn<T>,
     finished: bool,
 }
@@ -281,8 +280,7 @@ pub struct ClientCStreamReceiver<T> {
 impl<T> ClientCStreamReceiver<T> {
     /// Cancel the call.
     pub fn cancel(&mut self) {
-        let lock = self.call.lock();
-        lock.call.cancel()
+        self.call.call.cancel()
     }
 
     #[inline]
@@ -306,10 +304,7 @@ impl<T> Future for ClientCStreamReceiver<T> {
     type Error = Error;
 
     fn poll(&mut self) -> Poll<T, Error> {
-        let data = {
-            let mut call = self.call.lock();
-            try_ready!(call.poll_finish())
-        };
+        let data = { try_ready!(self.call.poll_finish()) };
         let t = (self.resp_de)(data.unwrap())?;
         self.finished = true;
         Ok(Async::Ready(t))
@@ -322,14 +317,14 @@ impl<T> Future for ClientCStreamReceiver<T> {
 /// [`close`]: #method.close
 #[must_use = "if unused the StreamingCallSink may immediately cancel the RPC"]
 pub struct StreamingCallSink<Req> {
-    call: Arc<SpinLock<ShareCall>>,
+    call: ShareCall,
     sink_base: SinkBase,
     close_f: Option<BatchFuture>,
     req_ser: SerializeFn<Req>,
 }
 
 impl<Req> StreamingCallSink<Req> {
-    fn new(call: Arc<SpinLock<ShareCall>>, req_ser: SerializeFn<Req>) -> StreamingCallSink<Req> {
+    fn new(call: ShareCall, req_ser: SerializeFn<Req>) -> StreamingCallSink<Req> {
         StreamingCallSink {
             call,
             sink_base: SinkBase::new(false),
@@ -339,8 +334,7 @@ impl<Req> StreamingCallSink<Req> {
     }
 
     pub fn cancel(&mut self) {
-        let call = self.call.lock();
-        call.call.cancel()
+        self.call.call.cancel()
     }
 }
 
@@ -361,10 +355,7 @@ impl<Req> Sink for StreamingCallSink<Req> {
     type SinkError = Error;
 
     fn start_send(&mut self, (msg, flags): Self::SinkItem) -> StartSend<Self::SinkItem, Error> {
-        {
-            let mut call = self.call.lock();
-            call.check_alive()?;
-        }
+        self.call.check_alive()?;
         self.sink_base
             .start_send(&mut self.call, &msg, flags, self.req_ser)
             .map(|s| {
@@ -377,25 +368,21 @@ impl<Req> Sink for StreamingCallSink<Req> {
     }
 
     fn poll_complete(&mut self) -> Poll<(), Error> {
-        {
-            let mut call = self.call.lock();
-            call.check_alive()?;
-        }
+        self.call.check_alive()?;
         self.sink_base.poll_complete()
     }
 
     fn close(&mut self) -> Poll<(), Error> {
-        let mut call = self.call.lock();
         if self.close_f.is_none() {
             try_ready!(self.sink_base.poll_complete());
 
-            let close_f = call.call.start_send_close_client()?;
+            let close_f = self.call.call.start_send_close_client()?;
             self.close_f = Some(close_f);
         }
 
         if let Async::NotReady = self.close_f.as_mut().unwrap().poll()? {
             // if call is finished, can return early here.
-            call.check_alive()?;
+            self.call.check_alive()?;
             return Ok(Async::NotReady);
         }
         Ok(Async::Ready(()))
@@ -527,11 +514,11 @@ impl<Resp> Stream for ClientSStreamReceiver<Resp> {
 /// [`Cancelled`]: ./enum.RpcStatusCode.html#variant.Cancelled
 #[must_use = "if unused the ClientDuplexReceiver may immediately cancel the RPC"]
 pub struct ClientDuplexReceiver<Resp> {
-    imp: ResponseStreamImpl<Arc<SpinLock<ShareCall>>, Resp>,
+    imp: ResponseStreamImpl<ShareCall, Resp>,
 }
 
 impl<Resp> ClientDuplexReceiver<Resp> {
-    fn new(call: Arc<SpinLock<ShareCall>>, de: DeserializeFn<Resp>) -> ClientDuplexReceiver<Resp> {
+    fn new(call: ShareCall, de: DeserializeFn<Resp>) -> ClientDuplexReceiver<Resp> {
         ClientDuplexReceiver {
             imp: ResponseStreamImpl::new(call, de),
         }
