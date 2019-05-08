@@ -123,16 +123,7 @@ impl SpawnNotify {
 
 impl Notify for SpawnNotify {
     fn notify(&self, _: usize) {
-        if thread::current().id() == self.worker_id {
-            poll(&Arc::new(self.clone()), false)
-        } else {
-            let mut ctx = self.ctx.lock();
-            if ctx.kicked {
-                return;
-            }
-            ctx.notify(Box::new(CallTag::Spawn(self.clone())));
-            ctx.kicked = true;
-        }
+        poll(&Arc::new(self.clone()), false)
     }
 }
 
