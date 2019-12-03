@@ -388,8 +388,7 @@ macro_rules! impl_stream_sink {
     ($(#[$attr:meta])* $t:ident, $ft:ident, $holder:ty) => {
         $(#[$attr])*
         pub struct $t<T> {
-            call: Option<$holder>,
-            base: SinkBase,
+            base: SinkBase<$holder>,
             flush_f: Option<BatchFuture>,
             status: RpcStatus,
             flushed: bool,
@@ -400,8 +399,7 @@ macro_rules! impl_stream_sink {
         impl<T> $t<T> {
             fn new(call: $holder, ser: SerializeFn<T>) -> $t<T> {
                 $t {
-                    call: Some(call),
-                    base: SinkBase::new(true),
+                    base: SinkBase::new(call, true),
                     flush_f: None,
                     status: RpcStatus::ok(),
                     flushed: false,
@@ -418,7 +416,7 @@ macro_rules! impl_stream_sink {
             pub fn fail(mut self, status: RpcStatus) -> $ft {
                 assert!(self.flush_f.is_none());
                 let send_metadata = self.base.send_metadata;
-                let res = self.call.as_mut().unwrap().call(|c| {
+                let res = self.base.call.as_mut().unwrap().call(|c| {
                     c.call
                         .start_send_status_from_server(&status, send_metadata, &None, 0)
                 });
@@ -429,7 +427,7 @@ macro_rules! impl_stream_sink {
                 };
 
                 $ft {
-                    call: self.call.take().unwrap(),
+                    call: self.base.call.take().unwrap(),
                     fail_f: fail_f,
                     err: err,
                 }
@@ -444,8 +442,8 @@ macro_rules! impl_stream_sink {
             /// [`fail`]: #method.fail
             fn drop(&mut self) {
                 // We did not close it explicitly and it was not dropped in the `fail`.
-                if !self.closed && self.call.is_some() {
-                    let mut call = self.call.take().unwrap();
+                if !self.closed && self.base.call.is_some() {
+                    let mut call = self.base.call.take().unwrap();
                     call.call(|c| c.call.cancel());
                 }
             }
@@ -456,11 +454,10 @@ macro_rules! impl_stream_sink {
             type SinkError = Error;
 
             fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Error> {
-                if let Async::Ready(_) = self.call.as_mut().unwrap().call(ShareCall::poll_finish)? {
+                if let Async::Ready(_) = self.base.call.as_mut().unwrap().call(ShareCall::poll_finish)? {
                     return Err(Error::RemoteStopped);
                 }
-                self.base
-                    .start_send(self.call.as_mut().unwrap(), &item.0, item.1, self.ser)
+                self.base.start_send(&item.0, item.1, self.ser)
                     .map(|s| {
                         if s {
                             AsyncSink::Ready
@@ -471,7 +468,7 @@ macro_rules! impl_stream_sink {
             }
 
             fn poll_complete(&mut self) -> Poll<(), Error> {
-                if let Async::Ready(_) = self.call.as_mut().unwrap().call(ShareCall::poll_finish)? {
+                if let Async::Ready(_) = self.base.call.as_mut().unwrap().call(ShareCall::poll_finish)? {
                     return Err(Error::RemoteStopped);
                 }
                 self.base.poll_complete()
@@ -483,7 +480,7 @@ macro_rules! impl_stream_sink {
 
                     let send_metadata = self.base.send_metadata;
                     let status = &self.status;
-                    let flush_f = self.call.as_mut().unwrap().call(|c| {
+                    let flush_f = self.base.call.as_mut().unwrap().call(|c| {
                         c.call
                             .start_send_status_from_server(status, send_metadata, &None, 0)
                     })?;
@@ -495,7 +492,7 @@ macro_rules! impl_stream_sink {
                     self.flushed = true;
                 }
 
-                try_ready!(self.call.as_mut().unwrap().call(ShareCall::poll_finish));
+                try_ready!(self.base.call.as_mut().unwrap().call(ShareCall::poll_finish));
                 self.closed = true;
                 Ok(Async::Ready(()))
             }

@@ -311,8 +311,7 @@ impl<T> Future for ClientCStreamReceiver<T> {
 /// [`close`]: #method.close
 #[must_use = "if unused the StreamingCallSink may immediately cancel the RPC"]
 pub struct StreamingCallSink<Req> {
-    call: Arc<SpinLock<ShareCall>>,
-    sink_base: SinkBase,
+    sink_base: SinkBase<Arc<SpinLock<ShareCall>>>,
     close_f: Option<BatchFuture>,
     req_ser: SerializeFn<Req>,
 }
@@ -320,15 +319,14 @@ pub struct StreamingCallSink<Req> {
 impl<Req> StreamingCallSink<Req> {
     fn new(call: Arc<SpinLock<ShareCall>>, req_ser: SerializeFn<Req>) -> StreamingCallSink<Req> {
         StreamingCallSink {
-            call,
-            sink_base: SinkBase::new(false),
+            sink_base: SinkBase::new(call, false),
             close_f: None,
             req_ser,
         }
     }
 
     pub fn cancel(&mut self) {
-        let call = self.call.lock();
+        let call = self.sink_base.call.as_mut().unwrap().lock();
         call.call.cancel()
     }
 }
@@ -351,11 +349,11 @@ impl<Req> Sink for StreamingCallSink<Req> {
 
     fn start_send(&mut self, (msg, flags): Self::SinkItem) -> StartSend<Self::SinkItem, Error> {
         {
-            let mut call = self.call.lock();
+            let mut call = self.sink_base.call.as_mut().unwrap().lock();
             call.check_alive()?;
         }
         self.sink_base
-            .start_send(&mut self.call, &msg, flags, self.req_ser)
+            .start_send(&msg, flags, self.req_ser)
             .map(|s| {
                 if s {
                     AsyncSink::Ready
@@ -367,23 +365,24 @@ impl<Req> Sink for StreamingCallSink<Req> {
 
     fn poll_complete(&mut self) -> Poll<(), Error> {
         {
-            let mut call = self.call.lock();
+            let mut call = self.sink_base.call.as_mut().unwrap().lock();
             call.check_alive()?;
         }
         self.sink_base.poll_complete()
     }
 
     fn close(&mut self) -> Poll<(), Error> {
-        let mut call = self.call.lock();
         if self.close_f.is_none() {
             try_ready!(self.sink_base.poll_complete());
 
+            let mut call = self.sink_base.call.as_mut().unwrap().lock();
             let close_f = call.call.start_send_close_client()?;
             self.close_f = Some(close_f);
         }
 
         if let Async::NotReady = self.close_f.as_mut().unwrap().poll()? {
             // if call is finished, can return early here.
+            let mut call = self.sink_base.call.as_mut().unwrap().lock();
             call.check_alive()?;
             return Ok(Async::NotReady);
         }

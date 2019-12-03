@@ -4,21 +4,21 @@ pub mod client;
 pub mod server;
 
 use std::sync::Arc;
-use std::{ptr, slice};
+use std::{mem, ptr, slice};
 
 use crate::cq::CompletionQueue;
 use crate::grpc_sys::{self, grpc_call, grpc_call_error, grpcwrap_batch_context};
 use futures::{Async, Future, Poll};
 use libc::c_void;
 
-use crate::buf::{GrpcByteBuffer, GrpcByteBufferReader};
+use crate::buf::{GrpcByteBuffer, GrpcByteBufferReader, GrpcSlice};
 use crate::codec::{DeserializeFn, Marshaller, SerializeFn};
 use crate::error::{Error, Result};
-use crate::grpc_sys::grpc_status_code::*;
+use crate::grpc_sys::{grpc_byte_buffer, grpc_status_code::*};
 use crate::task::{self, unref_raw_tag, BatchFuture, BatchType, CallTag, SpinLock};
 
-// By default buffers in `SinkBase` will be shrink to 4K size.
-const BUF_SHRINK_SIZE: usize = 4 * 1024;
+// By default the batch size of `SinkBase` is 64K.
+const SINK_BATCH_SIZE: usize = 64 * 1024;
 
 /// An gRPC status code structure.
 /// This type contains constants for all gRPC status codes.
@@ -290,21 +290,20 @@ impl Call {
     /// Send a message asynchronously.
     pub fn start_send_message(
         &mut self,
-        msg: &[u8],
-        write_flags: u32,
+        msg: GrpcByteBuffer,
+        flags: u32,
         initial_meta: bool,
         batch: &mut *mut CallTag,
     ) -> Result<BatchFuture> {
         let _cq_ref = self.cq.borrow()?;
-        let ptr = msg.as_ptr() as _;
-        let len = msg.len();
+        let msg: *mut grpc_byte_buffer = unsafe { mem::transmute(msg) };
         let i = if initial_meta { 1 } else { 0 };
         let send_message = |ctx, tag| unsafe {
             match *(tag as *mut CallTag) {
                 CallTag::Batch(ref prom) => prom.ref_batch(),
                 _ => unreachable!(),
             }
-            grpc_sys::grpcwrap_call_send_message(self.call, ctx, ptr, len, write_flags, i, tag)
+            grpc_sys::grpcwrap_call_send_message(self.call, ctx, msg, flags, i, tag)
         };
 
         let (f, tag) = if !batch.is_null() {
@@ -654,34 +653,33 @@ impl WriteFlags {
 }
 
 /// A helper struct for constructing Sink object for batch requests.
-struct SinkBase {
-    batch_f: Option<BatchFuture>,
-    buf: Vec<u8>,
+struct SinkBase<C: ShareCallHolder> {
+    call: Option<C>,
     send_metadata: bool,
+    batch_f: Option<BatchFuture>,
+
+    buf: Vec<u8>,
+    flags: WriteFlags,
 
     tag: *mut CallTag,
 }
 
 // Because it carrys a `CallTag`.
-unsafe impl Send for SinkBase {}
+unsafe impl<C: ShareCallHolder> Send for SinkBase<C> {}
 
-impl SinkBase {
-    fn new(send_metadata: bool) -> SinkBase {
+impl<C: ShareCallHolder> SinkBase<C> {
+    fn new(call: C, send_metadata: bool) -> SinkBase<C> {
         SinkBase {
-            batch_f: None,
-            buf: Vec::new(),
+            call: Some(call),
             send_metadata,
+            batch_f: None,
+            buf: Vec::with_capacity(SINK_BATCH_SIZE),
+            flags: WriteFlags::default(),
             tag: ptr::null_mut(),
         }
     }
 
-    fn start_send<T, C: ShareCallHolder>(
-        &mut self,
-        call: &mut C,
-        t: &T,
-        mut flags: WriteFlags,
-        ser: SerializeFn<T>,
-    ) -> Result<bool> {
+    fn start_send<T>(&mut self, t: &T, flags: WriteFlags, ser: SerializeFn<T>) -> Result<bool> {
         if self.batch_f.is_some() {
             // try its best not to return false.
             self.poll_complete()?;
@@ -689,38 +687,65 @@ impl SinkBase {
                 return Ok(false);
             }
         }
-
-        self.buf.clear();
+        if self.buf.len() >= SINK_BATCH_SIZE {
+            return Ok(false);
+        }
         ser(t, &mut self.buf);
-        if flags.get_buffer_hint() && self.send_metadata {
-            // temporary fix: buffer hint with send meta will not send out any metadata.
-            flags = flags.buffer_hint(false);
-        }
-        let write_f = call.call(|c| {
-            c.call
-                .start_send_message(&self.buf, flags.flags, self.send_metadata, &mut self.tag)
-        })?;
-        // NOTE: Content of `self.buf` is copied into grpc internal.
-        if self.buf.capacity() > BUF_SHRINK_SIZE {
-            self.buf.truncate(BUF_SHRINK_SIZE);
-            self.buf.shrink_to_fit();
-        }
-        self.batch_f = Some(write_f);
-        self.send_metadata = false;
+        self.merge_flags(flags);
         Ok(true)
     }
 
     fn poll_complete(&mut self) -> Poll<(), Error> {
-        if let Some(ref mut batch_f) = self.batch_f {
-            try_ready!(batch_f.poll());
+        if let Some(mut batch_f) = self.batch_f.take() {
+            match batch_f.poll() {
+                Ok(Async::NotReady) => {
+                    self.batch_f = Some(batch_f);
+                    Ok(Async::NotReady)
+                }
+                Ok(Async::Ready(_)) => Ok(Async::Ready(())),
+                Err(e) => Err(e),
+            }
+        } else {
+            if self.do_send()? {
+                Ok(Async::Ready(()))
+            } else {
+                Ok(Async::NotReady)
+            }
+        }
+    }
+
+    fn merge_flags(&mut self, flags: WriteFlags) {
+        if flags.get_force_no_compress() {
+            self.flags = self.flags.force_no_compress(true);
+        }
+        if !flags.get_buffer_hint() {
+            self.flags = self.flags.buffer_hint(false);
+        }
+    }
+
+    fn do_send(&mut self) -> Result<bool> {
+        if self.buf.is_empty() {
+            return Ok(true);
         }
 
-        self.batch_f.take();
-        Ok(Async::Ready(()))
+        let metadata = mem::replace(&mut self.send_metadata, false);
+        let mut flags = mem::replace(&mut self.flags, Default::default());
+        if flags.get_buffer_hint() && metadata {
+            // temporary fix: buffer hint with send meta will not send out any metadata.
+            flags = flags.buffer_hint(false);
+        }
+
+        let buf = mem::replace(&mut self.buf, Default::default());
+        let b = GrpcByteBuffer::from(&GrpcSlice::from(buf));
+        let tag = &mut self.tag;
+        let call = self.call.as_mut().unwrap();
+        let write_f = call.call(|c| c.call.start_send_message(b, flags.flags, metadata, tag))?;
+        self.batch_f = Some(write_f);
+        Ok(false)
     }
 }
 
-impl Drop for SinkBase {
+impl<C: ShareCallHolder> Drop for SinkBase<C> {
     fn drop(&mut self) {
         unsafe { unref_raw_tag(self.tag) }
     }

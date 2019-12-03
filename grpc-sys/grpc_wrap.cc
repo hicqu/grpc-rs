@@ -652,15 +652,14 @@ GPR_EXPORT grpc_call_error GPR_CALLTYPE grpcwrap_call_recv_initial_metadata(
 }
 
 GPR_EXPORT grpc_call_error GPR_CALLTYPE grpcwrap_call_send_message(
-    grpc_call* call, grpcwrap_batch_context* ctx, const char* send_buffer,
-    size_t send_buffer_len, uint32_t write_flags,
-    int32_t send_empty_initial_metadata, void* tag) {
+    grpc_call* call, grpcwrap_batch_context* ctx, grpc_byte_buffer *send_buffer,
+    uint32_t write_flags, int32_t send_empty_initial_metadata, void* tag) {
   /* TODO: don't use magic number */
   grpc_op ops[2];
   memset(ops, 0, sizeof(ops));
   size_t nops = send_empty_initial_metadata ? 2 : 1;
   ops[0].op = GRPC_OP_SEND_MESSAGE;
-  ctx->send_message = string_to_byte_buffer(send_buffer, send_buffer_len);
+  ctx->send_message = send_buffer;
   ops[0].data.send_message.send_message = ctx->send_message;
   ops[0].flags = write_flags;
   ops[0].reserved = nullptr;
